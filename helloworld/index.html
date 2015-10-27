@@ -1,0 +1,17 @@
+<html>
+<head>
+<script src="http://mcorp.no/lib/mcorp-2.0.js"></script>
+<script src="http://mcorp.no/lib/mediasync.js"></script>
+<script type="text/javascript">
+var app = MCorp.app("4651377100653748657", {anon:true});
+app.run = function() {
+  app.sync = mediascape.mediaSync(document.getElementById('player'), app.msvs.shared);
+}
+window.onload = app.init;
+</script>
+</head>
+<body>
+<video src="thefox.mp4" id='player'></video>
+</body>
+</html>
+
