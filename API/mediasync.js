@@ -15,7 +15,7 @@ var mediascape = function(_MS_) {
    * a user interaction to actually perform the kick
    */
   var _need_kick;
-  function needKick(elem) {
+  function needKick(elem, onerror) {
     if (_need_kick === false) {
       return false;
     }
@@ -25,12 +25,63 @@ var mediascape = function(_MS_) {
     }
     var m = elem.muted;
     elem.muted = true
-    elem.play();
-    _need_kick = elem.paused == true;
-    elem.pause();
-    elem.muted = m;
+    var p;
+    try {
+      p = elem.play();
+    } catch (err) {
+      console.log("Error calling 'play'");
+      onerror(err);
+    };
+    if (p !== undefined) {
+      p.then(function() {
+        setTimeout(function() {
+          elem.pause();
+        }, 0);
+        elem.muted = m;
+      })
+      .catch(function(err) {
+        if (onerror) {
+          onerror(err);
+        } else {
+          console.log("Play failed, pass an error function to the needKick function to handle it (likely get the user to click a play button)");          
+        }
+      });
+    } else {
+      _need_kick = elem.paused === true;
+      elem.pause();    
+      elem.muted = m;
+    }
     return _need_kick;
   }
+
+  var setSync = function(func, target, msv) {
+    var state = msv.query();
+
+    if (state.vel === 0) {
+      // We stopped, trigger a single sync when the MSV changes
+      var handle_change = function() {
+        setSync(func, target, msv);
+      };
+      msv.on("change", function() {
+        if (this.query().vel !== 0) {
+          msv.off("change", handle_change);
+          handle_change();
+        }
+      });
+      return this;
+    }
+
+    var time_left = (target - state.pos)/state.vel;
+    if (time_left > 0.001) {
+      setTimeout(function() {
+        setSync(func, target, msv);
+      }, 1000 * ((time_left / 2.0) / state.vel));
+      return this;
+    }
+    func.call();
+    return {cancel:function()  {}};
+  };
+
 
   /**
    * The mediaSync object will try to synchronize an HTML 
@@ -61,43 +112,105 @@ var mediascape = function(_MS_) {
    *     better, we will.  If the target is too narrow, you'll end up
    *     with a more skippy experience.  When using variable playback
    *     rates, this parameter is ignored (target is always 0)
-   *  * remember (default true)
+   *  * remember (default false)
    *     Remember the last experience on this device - stores support
    *     or lack of support for variable playback rate.  Records in
    *     localStorage under key "mediascape_vpbr", clear it to re-learn
    */
   function mediaSync(elem, motion, options) {
     var API;
-    var _options = options || {};
-    _options.skew = _options.skew || 0.0;
-    _options.target = _options.target || 0.025;
-    _options.original_target = _options.target;
-    _options.loop = _options.loop || false;
-    _options.target = _options.target * 2; // Start out coarse
-    if (_options.remember === undefined){
-      _options.remember = true;
+    options = options || {};
+    options.skew = options.skew || 0.0;
+    options.target = options.target || 0.025;
+    options.original_target = options.target;
+    options.loop = options.loop || false;
+    options.target = options.target * 2; // Start out coarse
+    if (options.remember === undefined){
+      options.remember = false;
     }
-    if (_options.debug) {
-      localStorage.removeItem("mediascape_vpbr")
-      _options.remember = false;
+    if (options.debug || options.remember === false) {
+      localStorage.removeItem("mediascape_vpbr");
+      options.remember = false;
     }
-    if (_options.automute === undefined) {
-      _options.automute = true;
+    if (options.automute === undefined) {
+      options.automute = true;
     }
     var _auto_muted = false;
-    var _motion = motion;
+
+    var play = function() {
+      try {
+        var p = elem.play();
+        if (p) {
+          p.catch(function(err) {
+            console.log("Play error", err);
+            _doCallbacks("error", {event:"error", op:"play", msg:err});
+          });
+        }
+      } catch (err) {
+        console.log("Error in 'play':", err);
+        _doCallbacks("error", {event:"error", op:"play"});
+      }
+    };
+
+    var onchange = function(e) {
+      _bad = 0;
+      _samples = [];
+      _last_skip = null;
+
+      // If we're running but less than zero, we need to wake up when starting
+      if (motion.pos < -options.skew && motion.vel > 0) {
+
+        setSync(onchange, -options.skew, motion);
+      }
+      // If we're paused, ignore
+      //if (_stopped || _paused) {
+      //  console.log("Not active");
+      //  return;
+      // }
+     
+      if (_update_func !== undefined) {
+        _update_func(e);          
+      } else {
+        console.log("WARNING: onchange but no update func yet");
+      }
+    };
+
+    var setMotion = function(motion) {
+      _bad = 0;
+      if (_motion) {
+        _motion.off("change", onchange);        
+      }
+      _motion = motion;
+
+      // if motion is a timing object, we add some shortcuts
+      if (_motion.version == 3) {
+        _motion.__defineGetter__("pos", function() {return _motion.query().position;});
+        _motion.__defineGetter__("vel", function() {return _motion.query().velocity;});
+        _motion.__defineGetter__("acc", function() {return _motion.query().acceleration;});
+      }
+
+      _motion.on("change", onchange);
+    };
+
     if (!motion) {
       console.log("WARNING: No motion has been set");
+    } else {
+      //setMotion(motion);      
     }
+
+
     var _stopped = false;
+    var _paused = false;
+    var _motion;
 
     function onpaused() {
       if (_motion.vel == 1) {
-        elem.play();
+        play();          
       }      
     }
+
     function onplay() {
-      if (_motion.vel == 0) {
+      if (_motion.vel === 0) {
         elem.pause();
       }
     }
@@ -106,16 +219,20 @@ var mediascape = function(_MS_) {
       stop();      
     }
 
-    elem.addEventListener("paused", onpaused);
-    elem.addEventListener("play", onplay);
-    elem.addEventListener("error", onerror);
+    var pause = function(val) {
+      if (val === undefined) val = true;
+      _paused = val;
+      if (!_paused) {
+        onchange();
+      }
+    };
 
     var stop = function() {
       _stopped = true;
       elem.removeEventListener("paused", onpaused);
       elem.removeEventListener("play", onplay);
       elem.removeEventListener("error", onerror);
-    }
+    };
 
     var _update_func;
     var _bad = 0;
@@ -126,18 +243,17 @@ var mediascape = function(_MS_) {
     var _last_bad = 0;
     var _perfect = 5;
     var _is_in_sync = false;
-
     var _last_skip;
     var _thrashing = 0;
     var skip = function(pos) {
-      if (elem.readyState == 0) {
+      if (elem.readyState === 0) {
         return;
       }
       if (_motion.vel != 1) {
         // Just skip, don't do estimation
         elem.currentTime = pos;
         _last_skip = undefined;
-        _doCallbacks("skip", {event:"skip", pos:pos, target:_motion.pos, adjust:0})
+        _doCallbacks("skip", {event:"skip", pos:pos, target:_motion.pos, adjust:0});
         return;
       }
 
@@ -149,10 +265,10 @@ var mediascape = function(_MS_) {
           if (_thrashing > 3) {
             // We skipped just a short time ago, we're thrashing
             _dbg("Lost all confidence (thrashing)");
-            _options.target = Math.min(1, _options.target*2);            
+            options.target = Math.min(1, options.target*2);            
             _doCallbacks("target_change", {
               event: "target_change",
-              target: _options.target,
+              target: options.target,
               reason: "thrashing"
             });
             _thrashing = 0;
@@ -178,20 +294,20 @@ var mediascape = function(_MS_) {
           ts: now, //performance.now(),
           pos: pos,
           adjust: adjust
-        }
+        };
       }
       if (_is_in_sync) {
         _is_in_sync = false;
         _doCallbacks("sync", {event:"sync", sync:false});
       }
-      _doCallbacks("skip", {event:"skip", pos:pos + adjust, target:_motion.pos, adjust:adjust})
+      _doCallbacks("skip", {event:"skip", pos:pos + adjust, target:_motion.pos, adjust:adjust});
     };
 
 
     function loop(pos) {
-      if (_options.loop) {
-        if (_options.duration) {
-          return pos % _options.duration;          
+      if (options.loop) {
+        if (options.duration) {
+          return pos % options.duration;          
         } else {
           return pos % elem.duration;                    
         }
@@ -200,18 +316,19 @@ var mediascape = function(_MS_) {
     }
 
     // onTimeChange handler for variable playback rate
+    var last_pbr_diff;
     var update_func_playbackspeed = function(e) {
-      if (_stopped) {
+      if (_stopped || _paused) {
         return;
       }
-        var snapshot = _motion.query();
+        var snapshot = query();
         if (loop(snapshot.pos) == last_update) {
           return;
         }
         last_update = loop(snapshot.pos);
 
         // If we're outside of the media range, don't stress the system
-        var p = loop(snapshot.pos + _options.skew);
+        var p = loop(snapshot.pos + options.skew);
         var duration = elem.duration;
         if (duration) {
           if (p < 0 || p > duration) {
@@ -223,9 +340,9 @@ var mediascape = function(_MS_) {
         }
 
         // Force element to play/pause correctly
-        if (snapshot.vel != 0) {
+        if (snapshot.vel !== 0) {
           if (elem.paused) {
-            elem.play();
+            play();
           }
         } else if (!elem.paused) {
           elem.pause();
@@ -242,16 +359,24 @@ var mediascape = function(_MS_) {
           }
           // If we're WAY OFF, jump
           var diff = p - elem.currentTime;
-          if ((diff < -1) || (snapshot.vel == 0 || Math.abs(diff) > 1)) {
+          if ((diff < -1) || (snapshot.vel === 0 || Math.abs(diff) > 1)) {
             _dbg({type:"jump", diff:diff});
             // Stationary, we need to just jump
-            var new_pos = loop(snapshot.pos + _options.skew);
+            var new_pos = loop(snapshot.pos + options.skew);
             if (performance.now() - _last_bad > 150) {
-              _bad += 10;
+              //_bad += 10;
               _last_bad = performance.now();            
               skip(new_pos);
             }
             return;
+          }
+
+          // If the diff is substantially larger than last time we updated it, trigger as broken
+          if (last_pbr_diff && Math.abs(diff - last_pbr_diff) > 0.500) {
+            console.log("VPBR broken it seems", diff-last_pbr_diff);
+            _bad += 10;
+            //throw new Error("Variable playback rate seems broken");
+
           }
 
           // Need to smooth diffs, many browsers are too inconsistent!
@@ -262,54 +387,47 @@ var mediascape = function(_MS_) {
               avg += _samples[i];
             }
             diff = avg / _samples.length;
-            _samples = _samples.splice(0, 1);;
+            _samples = _samples.splice(0, 1);
           } else {
             return;
           }
 
           // Actual sync
           _dbg({type:"dbg", diff:diff, bad:_bad, vpbr:_vpbr});
-          function getRate(limit, suggested) {
-            //return _motion.vel + (diff*1000*diff*1000)/1000;
+          var getRate = function(limit, suggested) {
             return Math.min(_motion.vel+limit, Math.max(_motion.vel-limit, _motion.vel + suggested));
-            /*
-            var mult = 7;
-            if (limit < 1) mult = 5;
-            if (limit < 0.1) mult = 3;
-            if (limit < 0.025) mult = 2;
-            if (diff < 0) {
-              return Math.max(_motion.vel - limit, _motion.vel - mult*Math.pow(diff, 2));
-            }
-            return Math.min(_motion.vel + limit, _motion.vel + mult*Math.pow(diff, 2));
-            */
-          }
+          };
 
           if (Math.abs(diff) > 1) {
             _samples = [];
             elem.playbackRate = getRate(1, diff*1.3); //Math.max(0, _motion.vel + (diff * 1.30));
+            last_pbr_diff = diff;
             _dbg({type:"vpbr", level:"coarse", rate:elem.playbackRate});
-            _bad += 20;
+            _bad += 4;
           } else if (Math.abs(diff) > 0.5) {
             _samples = [];
             elem.playbackRate = getRate(0.5, diff*0.75);//Math.min(1.10, _motion.vel + (diff * 0.75));
+            last_pbr_diff = diff;
             _dbg({type:"vpbr", level:"mid", rate:elem.playbackRate});
-            _bad += 10;
+            _bad += 2;
           } else if (Math.abs(diff) > 0.1) {
             _samples = [];
             elem.playbackRate = getRate(0.4, diff*0.75);//Math.min(1.10, _motion.vel + (diff * 0.75));
+            last_pbr_diff = diff;
             _dbg({type:"vpbr", level:"midfine", rate:elem.playbackRate});
-            _bad += 6;
+            _bad += 1;
           } else if (Math.abs(diff) > 0.025) {
             _samples = [];
             elem.playbackRate = getRate(0.30, diff*0.60)//Math.min(1.015, _motion.vel + (diff * 0.30));
-            _dbg({type:"vpbr", level:"fine", rate:elem.playbackRate});
+             last_pbr_diff = diff;
+           _dbg({type:"vpbr", level:"fine", rate:elem.playbackRate});
           } else {
             if (!_vpbr) {
               _bad = Math.max(0, _bad-20);
               _amazing++;
               if (_amazing > 5) {
                 _vpbr = true; // Very unlikely to get here if we don't support it!
-                if (localStorage && _options.remember) {
+                if (localStorage && options.remember) {
                   _dbg("Variable Playback Rate capability stored");
                   localStorage["mediascape_vpbr"] = JSON.stringify({'appVersion':navigator.appVersion, "vpbr":true});
                 }
@@ -323,8 +441,9 @@ var mediascape = function(_MS_) {
               });
             }
             elem.playbackRate = getRate(0.02, diff * 0.07); //_motion.vel + (diff * 0.1);
-          }
-        if (_options.automute) {
+            last_pbr_diff = diff;
+        }
+        if (options.automute) {
           if (!elem.muted && (elem.playbackRate > 1.05 || elem.playbackRate < 0.95)) {
             _auto_muted = true;              
             elem.muted = true;
@@ -340,11 +459,11 @@ var mediascape = function(_MS_) {
 
       } catch (err) {
         // Not supported after all!
-        if (_options.automute) {
+        if (options.automute) {
           elem.muted = false;
         }
         _last_skip = null;  // Reset skip stuff
-        if (localStorage && _options.remember) {
+        if (localStorage && options.remember) {
           _dbg("Variable Playback Rate NOT SUPPORTED, remembering this  ");
           localStorage["mediascape_vpbr"] = JSON.stringify({'appVersion':navigator.appVersion, "vpbr":false});
         }
@@ -357,18 +476,30 @@ var mediascape = function(_MS_) {
     var last_diff;
     // timeUpdate handler for skip based sync
     var update_func_skip = function(ev) {
-      if (_stopped) {
+      if (_stopped || _paused) {
         return;
       }
 
-      var snapshot = _motion.query();
+      var snapshot = query();
+      var duration = elem.duration;
+      if (duration) {
+        if (snapshot.pos < 0 || snapshot.pos > duration) {  // Use snapshot, skew is not part of this
+          if (!elem.paused) {
+            elem.currentTime = duration - 0.03;
+            elem.pause();
+          }
+          return;
+        }
+      }
+
       if (snapshot.vel > 0) {
         if (elem.paused) {
-          elem.play();
+          play();
         }
       } else if (!elem.paused) {
         elem.pause();
       }
+
 
       if (snapshot.vel != 1) {
         if (loop(snapshot.pos) == last_pos) {
@@ -377,20 +508,20 @@ var mediascape = function(_MS_) {
         last_pos = snapshot.pos;
         _dbg("Jump, playback speed is not :", snapshot.vel);
         // We need to just jump
-        var new_pos = loop(snapshot.pos + _options.skew);
+        var new_pos = loop(snapshot.pos + options.skew);
         if (elem.currentTime != new_pos) {
           skip(new_pos, "jump");
         }
         return;
       }
 
-      var p = snapshot.pos + _options.skew;
+      var p = snapshot.pos + options.skew;
       var diff = p - elem.currentTime;
 
       // If this was a Motion jump, skip immediately
       if (ev != undefined && ev.pos != undefined) {
         _dbg("MOTION JUMP");
-        var new_pos = snapshot.pos + _options.skew;
+        var new_pos = snapshot.pos + options.skew;
         skip(new_pos);
         return;
       }
@@ -416,48 +547,48 @@ var mediascape = function(_MS_) {
       if (_perfect <= -2) {
         // We are failing to meet the target, make target bigger
         _dbg("Lost all confidence");
-        _options.target = Math.min(1, _options.target*1.4);
+        options.target = Math.min(1, options.target*1.4);
         _perfect = 0;
         _doCallbacks("target_change", {
           event: "target_change",
-          target: _options.target,
+          target: options.target,
           reason: "unknown"
         });
       } else if (_perfect > 15) {
         // We are hitting the target, make target smaller if we're beyond the users preference
         _dbg("Feels better");
-        if (_options.target == _options.original_target) {
+        if (options.target == options.original_target) {
           // We're improving yet 'perfect', trigger "good" sync event
           if (!_is_in_sync) {
             _is_in_sync = true;
             _doCallbacks("sync", {event:"sync", sync:true});
           }
         }
-        _options.target = Math.max(Math.abs(diff) * 0.7, _options.original_target);
+        options.target = Math.max(Math.abs(diff) * 0.7, options.original_target);
         _perfect -= 8;
         _doCallbacks("target_change", {
           event: "target_change",
-          target: _options.target,
+          target: options.target,
           reason: "improving"
         });
       }
 
-      _dbg({type:"dbg", diff:diff, target:_options.target, perfect:_perfect});
+      _dbg({type:"dbg", diff:diff, target:options.target, perfect:_perfect});
 
-      if (Math.abs(diff) > _options.target) {
+      if (Math.abs(diff) > options.target) {
         // Target miss - if we're still confident, don't do anything about it
         _perfect -= 1;
         if (_perfect > 0) {
           return;
         }
         // We've had too many misses, skip
-        new_pos = _motion.pos + _options.skew
+        new_pos = _motion.pos + options.skew
         //_dbg("Adjusting time to " + new_pos);
         _perfect += 8;  // Give some breathing space
         skip(new_pos);
       } else {
         // Target hit
-        if (Math.abs(diff - last_diff) < _options.target / 2) {
+        if (Math.abs(diff - last_diff) < options.target / 2) {
           _perfect++;
         }
         last_diff = diff;
@@ -465,11 +596,13 @@ var mediascape = function(_MS_) {
     }
 
     var _initialized = false;
-    function init() {
+    var init = function() {
       if (_initialized) return;
       _initialized = true;
-
-      if (localStorage && _options.remember) {
+      if (_motion === undefined) {
+        setMotion(motion);
+      }
+      if (localStorage && options.remember) {
          if (localStorage["mediascape_vpbr"]) {
             var vpbr = JSON.parse(localStorage["mediascape_vpbr"]);
             if (vpbr.appVersion === navigator.appVersion) {
@@ -478,14 +611,14 @@ var mediascape = function(_MS_) {
          }
       }
 
-      if (_options.mode === "vpbr") {
+      if (options.mode === "vpbr") {
         _vpbr = true;
       }
-      if (_options.mode === "skip" || _vpbr === false) {
+      if (options.mode === "skip" || _vpbr === false) {
         elem.playbackRate = 1.0;
         _update_func = update_func_skip;
       } else {
-        if (_options.automute) {
+        if (options.automute) {
           elem.muted = true;
           _auto_muted = true;
           _doCallbacks("muted", {event:"muted", muted:true});
@@ -495,15 +628,17 @@ var mediascape = function(_MS_) {
       elem.removeEventListener("canplay", init);
       elem.removeEventListener("playing", init);
       _setUpdateFunc(_update_func);
-      _motion.on("change", onchange);
+      //_motion.on("change", onchange);
     } 
 
     elem.addEventListener("canplay", init);
     elem.addEventListener("playing", init);    
 
     var _last_update_func;
+    var _poller;
     var _setUpdateFunc = function(func) {
       if (_last_update_func) {
+        clearInterval(_poller);
         elem.removeEventListener("timeupdate", _last_update_func);
         elem.removeEventListener("pause", _last_update_func);
         elem.removeEventListener("ended", _last_update_func);        
@@ -521,36 +656,32 @@ var mediascape = function(_MS_) {
       }
     }
 
-    var onchange = function(e) {
-      _bad = 0;
-      _samples = [];
-      _last_skip = null;
-      if (_update_func != undefined) {
-        _update_func(e);          
-      } else {
-        console.log("WARNING: onchange but no update func yet");
+    var query = function() {
+      // Handle both msvs and timing objects
+      if (_motion.version == 3) {
+        var q = _motion.query();
+        return {
+          pos: q.position,
+          vel: q.velocity,
+          acc: q.acceleration
+        }
       }
+      return _motion.query();
     }
 
-    var setMotion = function(motion) {
-      _bad = 0;
-      _motion.off("change", onchange);
-      _motion = motion;
-      _motion.on("change", onchange);
-    };
 
     var setSkew = function(skew) {
-      _options.skew = skew;
+      options.skew = skew;
     }
 
     var getSkew = function() {
-      return _options.skew;
+      return options.skew;
     }
 
     var setOption = function(option, value) {
-      _options[option] = value;
+      options[option] = value;
       if (option === "target") {
-        _options.original_target = value;
+        options.original_target = value;
       }
     }
 
@@ -588,7 +719,8 @@ var mediascape = function(_MS_) {
       mode_change: [],
       target_change: [],
       muted: [],
-      sync: []
+      sync: [],
+      error: []
     };
     var _doCallbacks = function(what, e) {
       if (!_callbacks.hasOwnProperty(what)) {
@@ -647,14 +779,14 @@ var mediascape = function(_MS_) {
 
 
     function _dbg() {
-      if (!_options.debug) {
+      if (!options.debug) {
         return;
       }
-      if (typeof(_options.debug) === "function") {
-        //_options.debug(arguments);
+      if (typeof(options.debug) === "function") {
+        //options.debug(arguments);
         var args = arguments;
         setTimeout(function() {
-          _options.debug.apply(window, args);
+          options.debug.apply(window, args);
         }, 0);
       } else {
         var args = [];
@@ -665,6 +797,9 @@ var mediascape = function(_MS_) {
       }
     }
 
+
+
+
     // Export the API
     API = {
       setSkew: setSkew,
@@ -673,8 +808,10 @@ var mediascape = function(_MS_) {
       getMethod: getMethod,
       setMotion: setMotion,
       stop: stop,
+      pause: pause,
       on: on,
-      off: off
+      off: off,
+      init:init
     };
     return API;
   }
@@ -684,9 +821,11 @@ var mediascape = function(_MS_) {
   return _MS_;
 } (mediascape || {});
 
+
 // Support mcorp integration too
-if (MCorp) {
-  MCorp.mediaSync = mediascape.mediaSync;
-  MCorp.mediaNeedKick = mediascape.mediaNeedKick;
+if (!window.hasOwnProperty("MCorp")) {
+  MCorp = {};
 }
 
+MCorp.mediaSync = mediascape.mediaSync;
+MCorp.mediaNeedKick = mediascape.mediaNeedKick;
