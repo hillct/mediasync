@@ -24,15 +24,14 @@ var mediascape = function(_MS_) {
       return false;
     }
     var m = elem.muted;
-    elem.muted = true
+    elem.muted = true;
     var p;
     try {
       p = elem.play();
     } catch (err) {
-      console.log("Error calling 'play'");
       onerror(err);
-    };
-    if (p !== undefined) {
+    }
+    if (p !== undefined && p.then) {
       p.then(function() {
         setTimeout(function() {
           elem.pause();
@@ -50,6 +49,9 @@ var mediascape = function(_MS_) {
       _need_kick = elem.paused === true;
       elem.pause();    
       elem.muted = m;
+    }
+    if (_need_kick && onerror) {
+      onerror("Play failed");
     }
     return _need_kick;
   }
@@ -115,7 +117,7 @@ var mediascape = function(_MS_) {
    *  * remember (default false)
    *     Remember the last experience on this device - stores support
    *     or lack of support for variable playback rate.  Records in
-   *     localStorage under key "mediascape_vpbr", clear it to re-learn
+   *     localStorage under key.mediasync_vpbr clear it to re-learn
    */
   function mediaSync(elem, motion, options) {
     var API;
@@ -125,11 +127,18 @@ var mediascape = function(_MS_) {
     options.original_target = options.target;
     options.loop = options.loop || false;
     options.target = options.target * 2; // Start out coarse
+    if (!options.mode) {
+      if (navigator.userAgent.indexOf('Safari') != -1 && navigator.userAgent.indexOf('Chrome') == -1) {
+        options.mode = "skip";
+      } else {
+        options.mode = "auto";
+      }
+    }
     if (options.remember === undefined){
       options.remember = false;
     }
     if (options.debug || options.remember === false) {
-      localStorage.removeItem("mediascape_vpbr");
+      localStorage.removeItem("mediasync_vpbr");
       options.remember = false;
     }
     if (options.automute === undefined) {
@@ -373,7 +382,7 @@ var mediascape = function(_MS_) {
 
           // If the diff is substantially larger than last time we updated it, trigger as broken
           if (last_pbr_diff && Math.abs(diff - last_pbr_diff) > 0.500) {
-            console.log("VPBR broken it seems", diff-last_pbr_diff);
+            //console.log("VPBR broken it seems", diff-last_pbr_diff);
             _bad += 10;
             //throw new Error("Variable playback rate seems broken");
 
@@ -418,7 +427,7 @@ var mediascape = function(_MS_) {
             _bad += 1;
           } else if (Math.abs(diff) > 0.025) {
             _samples = [];
-            elem.playbackRate = getRate(0.30, diff*0.60)//Math.min(1.015, _motion.vel + (diff * 0.30));
+            elem.playbackRate = getRate(0.30, diff*0.60); //Math.min(1.015, _motion.vel + (diff * 0.30));
              last_pbr_diff = diff;
            _dbg({type:"vpbr", level:"fine", rate:elem.playbackRate});
           } else {
@@ -429,7 +438,7 @@ var mediascape = function(_MS_) {
                 _vpbr = true; // Very unlikely to get here if we don't support it!
                 if (localStorage && options.remember) {
                   _dbg("Variable Playback Rate capability stored");
-                  localStorage["mediascape_vpbr"] = JSON.stringify({'appVersion':navigator.appVersion, "vpbr":true});
+                  localStorage.mediasync_vpbr = JSON.stringify({'appVersion':navigator.appVersion, "vpbr":true});
                 }
               }
             }
@@ -465,7 +474,7 @@ var mediascape = function(_MS_) {
         _last_skip = null;  // Reset skip stuff
         if (localStorage && options.remember) {
           _dbg("Variable Playback Rate NOT SUPPORTED, remembering this  ");
-          localStorage["mediascape_vpbr"] = JSON.stringify({'appVersion':navigator.appVersion, "vpbr":false});
+          localStorage.mediasync_vpbr = JSON.stringify({'appVersion':navigator.appVersion, "vpbr":false});
         }
         console.log("Error setting variable playback speed - seems broken", err);
         _setUpdateFunc(update_func_skip);
@@ -482,6 +491,7 @@ var mediascape = function(_MS_) {
 
       var snapshot = query();
       var duration = elem.duration;
+      var new_pos;
       if (duration) {
         if (snapshot.pos < 0 || snapshot.pos > duration) {  // Use snapshot, skew is not part of this
           if (!elem.paused) {
@@ -508,7 +518,7 @@ var mediascape = function(_MS_) {
         last_pos = snapshot.pos;
         _dbg("Jump, playback speed is not :", snapshot.vel);
         // We need to just jump
-        var new_pos = loop(snapshot.pos + options.skew);
+        new_pos = loop(snapshot.pos + options.skew);
         if (elem.currentTime != new_pos) {
           skip(new_pos, "jump");
         }
@@ -519,9 +529,9 @@ var mediascape = function(_MS_) {
       var diff = p - elem.currentTime;
 
       // If this was a Motion jump, skip immediately
-      if (ev != undefined && ev.pos != undefined) {
+      if (ev !== undefined && ev.pos !== undefined) {
         _dbg("MOTION JUMP");
-        var new_pos = snapshot.pos + options.skew;
+        new_pos = snapshot.pos + options.skew;
         skip(new_pos);
         return;
       }
@@ -582,7 +592,7 @@ var mediascape = function(_MS_) {
           return;
         }
         // We've had too many misses, skip
-        new_pos = _motion.pos + options.skew
+        new_pos = _motion.pos + options.skew;
         //_dbg("Adjusting time to " + new_pos);
         _perfect += 8;  // Give some breathing space
         skip(new_pos);
@@ -593,7 +603,7 @@ var mediascape = function(_MS_) {
         }
         last_diff = diff;
       }
-    }
+    };
 
     var _initialized = false;
     var init = function() {
@@ -603,8 +613,8 @@ var mediascape = function(_MS_) {
         setMotion(motion);
       }
       if (localStorage && options.remember) {
-         if (localStorage["mediascape_vpbr"]) {
-            var vpbr = JSON.parse(localStorage["mediascape_vpbr"]);
+         if (localStorage.mediasync_vpbr) {
+            var vpbr = JSON.parse(localStorage.mediasync_vpbr);
             if (vpbr.appVersion === navigator.appVersion) {
               _vpbr = vpbr.vpbr;
             }
@@ -629,7 +639,7 @@ var mediascape = function(_MS_) {
       elem.removeEventListener("playing", init);
       _setUpdateFunc(_update_func);
       //_motion.on("change", onchange);
-    } 
+    };
 
     elem.addEventListener("canplay", init);
     elem.addEventListener("playing", init);    
@@ -654,7 +664,7 @@ var mediascape = function(_MS_) {
       } else {
         _doCallbacks("mode_change", {event:"mode_change", mode:"skip"});
       }
-    }
+    };
 
     var query = function() {
       // Handle both msvs and timing objects
@@ -664,26 +674,26 @@ var mediascape = function(_MS_) {
           pos: q.position,
           vel: q.velocity,
           acc: q.acceleration
-        }
+        };
       }
       return _motion.query();
-    }
+    };
 
 
     var setSkew = function(skew) {
       options.skew = skew;
-    }
+    };
 
     var getSkew = function() {
       return options.skew;
-    }
+    };
 
     var setOption = function(option, value) {
       options[option] = value;
       if (option === "target") {
         options.original_target = value;
       }
-    }
+    };
 
     /*
      * Return 'playbackRate' or 'skip' for play method 
@@ -693,7 +703,7 @@ var mediascape = function(_MS_) {
         return "playbackRate";
       } 
       return "skip";
-    }
+    };
 
     // As we are likely asynchronous, we don't really know if elem is already
     // ready!  If it has, it will not emit canplay.  Also, canplay seems shady
@@ -705,11 +715,11 @@ var mediascape = function(_MS_) {
           var event = new Event("canplay");
           elem.dispatchEvent(event);
         } catch (e) {
-          var event = document.createEvent("Event");
-          event.initEvent("canplay", true, false)
-          elem.dispatchEvent(event);
+          var event2 = document.createEvent("Event");
+          event2.initEvent("canplay", true, false);
+          elem.dispatchEvent(event2);
         }
-      };
+      }
     }, 100);
 
 
@@ -730,8 +740,8 @@ var mediascape = function(_MS_) {
         h = _callbacks[what][i];
         try {
           h.call(API, e);
-        } catch (e) {
-          console.log("Error in " + what + ": " + h + ": " + e);
+        } catch (e2) {
+          console.log("Error in " + what + ": " + h + ": " + e2);
         }
       }
     };
@@ -789,11 +799,11 @@ var mediascape = function(_MS_) {
           options.debug.apply(window, args);
         }, 0);
       } else {
-        var args = [];
+        var args2 = [];
         for (var k in arguments) {
-          args.push(arguments[k]);
+          args2.push(arguments[k]);
         }
-        console.log(JSON.stringify(args));
+        console.log(JSON.stringify(args2));
       }
     }
 
