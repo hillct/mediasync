@@ -23,8 +23,9 @@ var mediascape = function(_MS_) {
       _need_kick = false;
       return false;
     }
-    var m = elem.muted;
-    elem.muted = true;
+    var vol = elem.volume;
+    // If muted, we won't detect MEI on Chrome but we want to be quiet
+    elem.volume = 0.01;  
     var p;
     try {
       p = elem.play();
@@ -35,8 +36,9 @@ var mediascape = function(_MS_) {
       p.then(function() {
         setTimeout(function() {
           elem.pause();
+          elem.volume = vol;
         }, 0);
-        elem.muted = m;
+
       })
       .catch(function(err) {
         if (onerror) {
@@ -48,7 +50,7 @@ var mediascape = function(_MS_) {
     } else {
       _need_kick = elem.paused === true;
       elem.pause();    
-      elem.muted = m;
+      elem.volume = vol;
     }
     if (_need_kick && onerror) {
       onerror("Play failed");
@@ -96,7 +98,7 @@ var mediascape = function(_MS_) {
    *     how many seconds (float) should be added to the 
    *     motion before synchronization.  Calculate by 
    *     start point of element - start point of motion
-   *  * automute (default true)
+   *  * automute (default false)
    *     Mute the media element when playing too fast (or too slow) 
    *  * mode (default "auto")
    *     "skip": Force "skip" mode - i.e. don't try using playbackRate.
@@ -142,7 +144,7 @@ var mediascape = function(_MS_) {
       options.remember = false;
     }
     if (options.automute === undefined) {
-      options.automute = true;
+      options.automute = false;
     }
     var _auto_muted = false;
 
@@ -151,12 +153,10 @@ var mediascape = function(_MS_) {
         var p = elem.play();
         if (p) {
           p.catch(function(err) {
-            console.log("Play error", err);
             _doCallbacks("error", {event:"error", op:"play", msg:err});
           });
         }
       } catch (err) {
-        console.log("Error in 'play':", err);
         _doCallbacks("error", {event:"error", op:"play"});
       }
     };
@@ -168,8 +168,8 @@ var mediascape = function(_MS_) {
 
       // If we're running but less than zero, we need to wake up when starting
       if (motion.pos < -options.skew && motion.vel > 0) {
-
-        setSync(onchange, -options.skew, motion);
+        setTimeout(function() { setSync(onchange, -options.skew, motion) }, 100);
+        return;
       }
       // If we're paused, ignore
       //if (_stopped || _paused) {
@@ -192,7 +192,7 @@ var mediascape = function(_MS_) {
       _motion = motion;
 
       // if motion is a timing object, we add some shortcuts
-      if (_motion.version == 3) {
+      if (_motion.version >= 3) {
         _motion.__defineGetter__("pos", function() {return _motion.query().position;});
         _motion.__defineGetter__("vel", function() {return _motion.query().velocity;});
         _motion.__defineGetter__("acc", function() {return _motion.query().acceleration;});
@@ -239,7 +239,7 @@ var mediascape = function(_MS_) {
     var stop = function() {
       _stopped = true;
       elem.removeEventListener("paused", onpaused);
-      elem.removeEventListener("play", onplay);
+      elem.removeEventListener("playing", onplay);
       elem.removeEventListener("error", onerror);
     };
 
@@ -332,10 +332,11 @@ var mediascape = function(_MS_) {
       }
         var snapshot = query();
         if (loop(snapshot.pos) == last_update) {
+        /*  Figure out what this does - it makes it impossible to detect a reloaded video playing while we're not playing...
           return;
+          */
         }
         last_update = loop(snapshot.pos);
-
         // If we're outside of the media range, don't stress the system
         var p = loop(snapshot.pos + options.skew);
         var duration = elem.duration;
@@ -347,7 +348,6 @@ var mediascape = function(_MS_) {
             return;
           }
         }
-
         // Force element to play/pause correctly
         if (snapshot.vel !== 0) {
           if (elem.paused) {
@@ -367,6 +367,7 @@ var mediascape = function(_MS_) {
             throw new Error("Variable playback rate seems broken - " + _bad + " bad");
           }
           // If we're WAY OFF, jump
+          var ts = performance.now();
           var diff = p - elem.currentTime;
           if ((diff < -1) || (snapshot.vel === 0 || Math.abs(diff) > 1)) {
             _dbg({type:"jump", diff:diff});
@@ -389,18 +390,24 @@ var mediascape = function(_MS_) {
           }
 
           // Need to smooth diffs, many browsers are too inconsistent!
-          _samples.push(diff);
+          _samples.push({diff:diff, ts:ts, pos: p});
+          var dp = _samples[_samples.length - 1].pos - _samples[0].pos;
+          var dt = _samples[_samples.length - 1].ts - _samples[0].ts;
           if (_samples.length >= 3) {
             var avg = 0;
             for (var i = 0; i < _samples.length; i++) {
-              avg += _samples[i];
+              avg += _samples[i].diff;
             }
             diff = avg / _samples.length;
-            _samples = _samples.splice(0, 1);
+            if (_samples.length > 3) {
+              _samples = _samples.splice(0, 1);              
+            }
           } else {
             return;
           }
 
+          var pbr = 1000 * dp / dt;
+          //console.log("Playback rate was:", pbr, "reported", elem.playbackRate, elem.playbackRate - pbr);
           // Actual sync
           _dbg({type:"dbg", diff:diff, bad:_bad, vpbr:_vpbr});
           var getRate = function(limit, suggested) {
@@ -427,6 +434,9 @@ var mediascape = function(_MS_) {
             _bad += 1;
           } else if (Math.abs(diff) > 0.025) {
             _samples = [];
+            var newpbr = pbr - elem.playbackRate;
+            //console.log("New pbr", elem.playbackRate, "->", newpbr, getRate(0.30, diff*0.60));
+            //elem.playbackRate = newpbr;
             elem.playbackRate = getRate(0.30, diff*0.60); //Math.min(1.015, _motion.vel + (diff * 0.30));
              last_pbr_diff = diff;
            _dbg({type:"vpbr", level:"fine", rate:elem.playbackRate});
@@ -449,8 +459,9 @@ var mediascape = function(_MS_) {
                 sync: true
               });
             }
+            //elem.playbackRate = getRate(0.02, diff * 0.07) + (pbr - 1); //_motion.vel + (diff * 0.1);
             elem.playbackRate = getRate(0.02, diff * 0.07); //_motion.vel + (diff * 0.1);
-            last_pbr_diff = diff;
+            last_pbr_diff = diff;              
         }
         if (options.automute) {
           if (!elem.muted && (elem.playbackRate > 1.05 || elem.playbackRate < 0.95)) {
@@ -474,6 +485,7 @@ var mediascape = function(_MS_) {
         _last_skip = null;  // Reset skip stuff
         if (localStorage && options.remember) {
           _dbg("Variable Playback Rate NOT SUPPORTED, remembering this  ");
+          console.log("Variable playback speed not supported (remembered)");
           localStorage.mediasync_vpbr = JSON.stringify({'appVersion':navigator.appVersion, "vpbr":false});
         }
         console.log("Error setting variable playback speed - seems broken", err);
@@ -527,6 +539,7 @@ var mediascape = function(_MS_) {
 
       var p = snapshot.pos + options.skew;
       var diff = p - elem.currentTime;
+      var ts = performance.now();
 
       // If this was a Motion jump, skip immediately
       if (ev !== undefined && ev.pos !== undefined) {
@@ -537,11 +550,11 @@ var mediascape = function(_MS_) {
       }
 
       // Smooth diffs as currentTime is often inconsistent
-      _samples.push(diff);
+      _samples.push({diff:diff, ts:ts, pos: p});
       if (_samples.length >= 3) {
         var avg = 0;
         for (var i = 0; i < _samples.length; i++) {
-          avg += _samples[i];
+          avg += _samples[i].diff;
         }
         diff = avg / _samples.length;
         _samples.splice(0, 1);
@@ -668,7 +681,7 @@ var mediascape = function(_MS_) {
 
     var query = function() {
       // Handle both msvs and timing objects
-      if (_motion.version == 3) {
+      if (_motion.version >= 3) {
         var q = _motion.query();
         return {
           pos: q.position,
